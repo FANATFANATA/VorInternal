@@ -1,3 +1,5 @@
 /.vscode
 /build
 /builder.py
+/full_project_hpp.txt
+/VorInternal.txt

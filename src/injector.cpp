@@ -1,5 +1,6 @@
 #include <Windows.h>
 #include <TlHelp32.h>
+#include <shellapi.h>
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -13,70 +14,60 @@ namespace
     constexpr DWORD MAX_PROCESS_WAIT_TIME_MS = 10000;
     constexpr DWORD PROCESS_WAIT_INTERVAL_MS = 500;
 
-    auto handle_closer = [](HANDLE h) noexcept
+    struct handle_closer
     {
-        if (h != nullptr && h != INVALID_HANDLE_VALUE)
+        void operator()(HANDLE h) const noexcept
         {
-            ::CloseHandle(h);
+            if (h && h != INVALID_HANDLE_VALUE)
+            {
+                ::CloseHandle(h);
+            }
         }
     };
 
-    using SmartHandle = std::shared_ptr<void>;
+    using unique_handle = std::unique_ptr<void, handle_closer>;
 
-    SmartHandle make_smart_handle(HANDLE h) noexcept
+    unique_handle make_handle(HANDLE h) noexcept
     {
-        return SmartHandle(h, handle_closer);
-    }
-
-    bool is_valid_handle(HANDLE h) noexcept
-    {
-        return h != nullptr && h != INVALID_HANDLE_VALUE;
-    }
-
-    std::wstring utf8_to_wide(const char *str)
-    {
-        if (!str)
-            return {};
-        const int size = ::MultiByteToWideChar(CP_UTF8, 0, str, -1, nullptr, 0);
-        if (size <= 0)
-            return {};
-        std::wstring result(static_cast<std::size_t>(size - 1), L'\0');
-        ::MultiByteToWideChar(CP_UTF8, 0, str, -1, result.data(), size);
-        return result;
+        return unique_handle(h);
     }
 
     std::wstring get_exe_directory()
     {
-        wchar_t buffer[MAX_PATH] = {};
-        DWORD length = ::GetModuleFileNameW(nullptr, buffer, MAX_PATH);
-        if (length == 0 || length >= MAX_PATH)
+        DWORD length = ::GetModuleFileNameW(nullptr, nullptr, 0);
+        if (length == 0)
             return {};
-        std::wstring path(buffer, length);
-        std::size_t pos = path.find_last_of(L"\\/");
+
+        std::wstring buffer(length, L'\0');
+        DWORD result = ::GetModuleFileNameW(nullptr, buffer.data(), length);
+        if (result == 0 || result >= length)
+            return {};
+
+        buffer.resize(result);
+        std::size_t pos = buffer.find_last_of(L"\\/");
         if (pos != std::wstring::npos)
         {
-            return path.substr(0, pos);
+            return buffer.substr(0, pos);
         }
         return {};
     }
 
     DWORD find_process_id(const std::wstring &process_name) noexcept
     {
-        SmartHandle snapshot = make_smart_handle(::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
-        if (!is_valid_handle(snapshot.get()))
+        unique_handle snapshot = make_handle(::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+        if (!snapshot)
             return 0;
 
-        PROCESSENTRY32W entry = {};
+        PROCESSENTRY32W entry{};
         entry.dwSize = sizeof(PROCESSENTRY32W);
-
-        if (!::Process32FirstW(static_cast<HANDLE>(snapshot.get()), &entry))
+        if (!::Process32FirstW(snapshot.get(), &entry))
             return 0;
 
         do
         {
-            if (process_name == entry.szExeFile)
+            if (_wcsicmp(process_name.c_str(), entry.szExeFile) == 0)
                 return entry.th32ProcessID;
-        } while (::Process32NextW(static_cast<HANDLE>(snapshot.get()), &entry));
+        } while (::Process32NextW(snapshot.get(), &entry));
 
         return 0;
     }
@@ -101,145 +92,133 @@ namespace
         return attribs != INVALID_FILE_ATTRIBUTES && !(attribs & FILE_ATTRIBUTE_DIRECTORY);
     }
 
-    bool inject_dll(DWORD process_id, const std::wstring &dll_path) noexcept
+    DWORD inject_dll(DWORD process_id, const std::wstring &dll_path) noexcept
     {
-        SmartHandle process = make_smart_handle(::OpenProcess(INJECTION_ACCESS, FALSE, process_id));
-        if (!is_valid_handle(process.get()))
-            return false;
+        unique_handle process = make_handle(::OpenProcess(INJECTION_ACCESS, FALSE, process_id));
+        if (!process)
+            return ::GetLastError();
 
         const std::size_t buffer_size = (dll_path.size() + 1) * sizeof(wchar_t);
-
-        LPVOID remote_memory = ::VirtualAllocEx(
-            static_cast<HANDLE>(process.get()),
-            nullptr,
-            buffer_size,
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE);
+        LPVOID remote_memory = ::VirtualAllocEx(process.get(), nullptr, buffer_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!remote_memory)
-            return false;
+            return ::GetLastError();
 
-        auto free_remote = [process_h = static_cast<HANDLE>(process.get()), remote_memory]() noexcept
+        auto free_remote = [&]() noexcept
         {
-            ::VirtualFreeEx(process_h, remote_memory, 0, MEM_RELEASE);
+            ::VirtualFreeEx(process.get(), remote_memory, 0, MEM_RELEASE);
         };
 
-        if (!::WriteProcessMemory(
-                static_cast<HANDLE>(process.get()),
-                remote_memory,
-                dll_path.c_str(),
-                buffer_size,
-                nullptr))
+        if (!::WriteProcessMemory(process.get(), remote_memory, dll_path.c_str(), buffer_size, nullptr))
         {
+            DWORD err = ::GetLastError();
             free_remote();
-            return false;
+            return err;
         }
 
         HMODULE kernel32 = ::GetModuleHandleW(L"kernel32.dll");
         if (!kernel32)
         {
             free_remote();
-            return false;
+            return ::GetLastError();
         }
 
-        auto load_library_w = reinterpret_cast<LPTHREAD_START_ROUTINE>(
-            ::GetProcAddress(kernel32, "LoadLibraryW"));
+        auto load_library_w = reinterpret_cast<LPTHREAD_START_ROUTINE>(::GetProcAddress(kernel32, "LoadLibraryW"));
         if (!load_library_w)
         {
             free_remote();
-            return false;
+            return ::GetLastError();
         }
 
-        SmartHandle thread = make_smart_handle(::CreateRemoteThread(
-            static_cast<HANDLE>(process.get()),
-            nullptr,
-            0,
-            load_library_w,
-            remote_memory,
-            0,
-            nullptr));
-        if (!is_valid_handle(thread.get()))
+        unique_handle thread = make_handle(::CreateRemoteThread(process.get(), nullptr, 0, load_library_w, remote_memory, 0, nullptr));
+        if (!thread)
         {
+            DWORD err = ::GetLastError();
             free_remote();
-            return false;
+            return err;
         }
 
-        DWORD wait_result = ::WaitForSingleObject(static_cast<HANDLE>(thread.get()), INFINITE);
+        DWORD wait_result = ::WaitForSingleObject(thread.get(), INFINITE);
         if (wait_result != WAIT_OBJECT_0)
         {
+            DWORD err = ::GetLastError();
             free_remote();
-            return false;
+            return err == 0 ? ERROR_INVALID_HANDLE : err;
         }
 
         DWORD exit_code = 0;
-        if (!::GetExitCodeThread(static_cast<HANDLE>(thread.get()), &exit_code))
+        if (!::GetExitCodeThread(thread.get(), &exit_code))
         {
+            DWORD err = ::GetLastError();
             free_remote();
-            return false;
+            return err;
         }
 
         free_remote();
-        return exit_code != 0;
+        return (exit_code != 0) ? ERROR_SUCCESS : ERROR_DLL_INIT_FAILED;
     }
 
     std::wstring resolve_absolute_path(const std::wstring &relative_path)
     {
-        wchar_t absolute_buffer[MAX_PATH] = {};
-        const DWORD length = ::GetFullPathNameW(relative_path.c_str(), MAX_PATH, absolute_buffer, nullptr);
-        if (length == 0 || length >= MAX_PATH)
+        DWORD length = ::GetFullPathNameW(relative_path.c_str(), 0, nullptr, nullptr);
+        if (length == 0)
             return {};
-        return std::wstring(absolute_buffer, length);
+
+        std::wstring buffer(length, L'\0');
+        DWORD result = ::GetFullPathNameW(relative_path.c_str(), length, buffer.data(), nullptr);
+        if (result == 0 || result >= length)
+            return {};
+
+        buffer.resize(result);
+        return buffer;
     }
 
-    int run_injector(int argc, char *argv[])
+    DWORD run_injector()
     {
         if (sizeof(void *) != 8)
         {
-            std::cerr << "Error: Injector must be compiled as x64 to inject into CS2 (x64).\n";
+            std::wcerr << L"Error: Injector must be compiled as x64.\n";
             return 1;
         }
+
+        int argc = 0;
+        LPWSTR *argv = ::CommandLineToArgvW(::GetCommandLineW(), &argc);
+        if (!argv)
+            return 1;
 
         std::wstring process_name = L"cs2.exe";
         std::wstring dll_path = L"VorInternal.dll";
 
         if (argc >= 2)
-        {
-            process_name = utf8_to_wide(argv[1]);
-        }
+            process_name = argv[1];
         if (argc >= 3)
-        {
-            dll_path = utf8_to_wide(argv[2]);
-        }
+            dll_path = argv[2];
 
         if (process_name.empty() || dll_path.empty())
         {
-            std::cerr << "Invalid arguments\n";
+            std::wcerr << L"Invalid arguments.\n";
+            ::LocalFree(argv);
             return 1;
         }
 
         std::wstring absolute_dll_path = resolve_absolute_path(dll_path);
         if (absolute_dll_path.empty() || !file_exists(absolute_dll_path))
         {
-            if (absolute_dll_path.empty())
+            std::wstring exe_dir = get_exe_directory();
+            if (!exe_dir.empty())
             {
-                absolute_dll_path = dll_path;
-            }
-            if (!file_exists(absolute_dll_path))
-            {
-                std::wstring exe_dir = get_exe_directory();
-                if (!exe_dir.empty())
+                std::wstring fallback_path = exe_dir + L"\\" + dll_path;
+                if (file_exists(fallback_path))
                 {
-                    std::wstring fallback_path = exe_dir + L"\\" + dll_path;
-                    if (file_exists(fallback_path))
-                    {
-                        absolute_dll_path = fallback_path;
-                    }
+                    absolute_dll_path = resolve_absolute_path(fallback_path);
                 }
             }
-            if (absolute_dll_path.empty() || !file_exists(absolute_dll_path))
-            {
-                std::wcerr << L"DLL not found: " << dll_path << L"\n";
-                return 1;
-            }
+        }
+
+        if (absolute_dll_path.empty() || !file_exists(absolute_dll_path))
+        {
+            std::wcerr << L"DLL not found: " << dll_path << L"\n";
+            ::LocalFree(argv);
+            return 1;
         }
 
         std::wcout << L"Waiting for " << process_name << L"...\n";
@@ -247,21 +226,26 @@ namespace
         if (process_id == 0)
         {
             std::wcerr << L"Process not found: " << process_name << L"\n";
+            ::LocalFree(argv);
             return 1;
         }
 
-        if (inject_dll(process_id, absolute_dll_path))
+        DWORD err = inject_dll(process_id, absolute_dll_path);
+        if (err == ERROR_SUCCESS)
         {
             std::wcout << L"Injected successfully into PID " << process_id << L"\n";
+            ::LocalFree(argv);
             return 0;
         }
 
-        std::cerr << "Injection failed (error: " << ::GetLastError() << ")\n";
+        std::wcerr << L"Injection failed (error: " << err << L")\n";
+        ::LocalFree(argv);
         return 1;
     }
 }
 
-int main(int argc, char *argv[])
+int main()
 {
-    return run_injector(argc, argv);
+    ::SetConsoleOutputCP(CP_UTF8);
+    return run_injector();
 }

@@ -1,5 +1,5 @@
 // Generated using https://github.com/a2x/cs2-dumper
-// 2026-05-30 18:41:26.078891600 UTC
+// 2026-06-02 17:22:40.833193100 UTC
 
 #pragma once
 
@@ -2039,11 +2039,6 @@ namespace cs2_dumper {
                 MOVETYPE_LAST = 0xB,
                 MOVETYPE_INVALID = 0xB,
                 MOVETYPE_MAX_BITS = 0x5
-            };
-            // Alignment: 2
-            // Member count: 0
-            enum class _ӆ___ : uint16_t {
-
             };
             // Parent: CCSWeaponBaseShotgun
             // Field count: 0
