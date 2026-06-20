@@ -28,7 +28,7 @@ struct ViewMatrix
 
 struct PlayerData
 {
-    std::string name;
+    char name[128]{};
     int health = 0;
     int armor = 0;
     std::uint8_t team = 0;
@@ -47,11 +47,10 @@ struct PlayerData
     float flash_duration = 0.0f;
 };
 
-#pragma pack(push, 1)
 struct Config
 {
     std::uint32_t magic = 0x564F5201;
-    std::uint32_t version = 8;
+    std::uint32_t version = 9;
     bool esp_enabled = true;
     bool esp_teammates = false;
     bool esp_outline = true;
@@ -91,7 +90,6 @@ struct Config
     float color_armor[4] = {0.2f, 0.6f, 1.0f, 1.0f};
     int language = 0;
 };
-#pragma pack(pop)
 
 struct SharedState
 {

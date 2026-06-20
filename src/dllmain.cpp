@@ -225,21 +225,21 @@ namespace
             int sh = static_cast<int>(ImGui::GetIO().DisplaySize.y);
 
             int r_idx = g_sharedState.read_index.load(std::memory_order_acquire);
-            auto src_players = g_sharedState.players_buffer[r_idx];
+            const auto& src_players = g_sharedState.players_buffer[r_idx];
             auto vm = g_sharedState.vm_buffer[r_idx];
             auto local_team = g_sharedState.local_team_buffer[r_idx];
 
-            std::vector<PlayerData> render_players;
-            render_players.reserve(src_players.size());
+            static std::vector<PlayerData> render_players;
+            render_players.clear();
             for (const auto &p : src_players)
             {
                 if (!g_config.esp_teammates && p.team == local_team)
                     continue;
-                PlayerData rp = p;
+                render_players.push_back(p);
+                auto& rp = render_players.back();
                 bool feet_w2s = math::w2s(rp.position, rp.feet_screen, vm, sw, sh);
                 bool head_w2s = math::w2s({rp.position.x, rp.position.y, rp.position.z + consts::HEAD_HEIGHT_OFFSET}, rp.head_screen, vm, sw, sh);
                 rp.is_on_screen = feet_w2s && head_w2s;
-                render_players.push_back(std::move(rp));
             }
 
             if (g_config.show_watermark)

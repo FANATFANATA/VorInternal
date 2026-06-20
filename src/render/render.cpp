@@ -767,7 +767,7 @@ void render::draw_esp(ImDrawList *const dl, const std::vector<PlayerData> &playe
 
         std::string info_text;
         if (cfg.show_names)
-            info_text += p.name + "\n";
+            info_text += p.name; info_text += "\n";
         if (cfg.show_distance)
             info_text += std::to_string(static_cast<int>(p.distance)) + "m\n";
         if (cfg.show_armor && p.armor > 0)
